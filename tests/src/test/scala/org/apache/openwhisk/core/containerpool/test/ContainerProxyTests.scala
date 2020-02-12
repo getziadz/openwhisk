@@ -22,6 +22,7 @@ import java.time.Instant
 import akka.actor.FSM.{CurrentState, SubscribeTransitionCallBack, Transition}
 import akka.actor.{ActorRef, ActorSystem, FSM}
 import akka.stream.scaladsl.Source
+import akka.testkit.CallingThreadDispatcher
 import akka.testkit.{ImplicitSender, TestKit}
 import akka.util.ByteString
 import common.{LoggedFunction, StreamLogging, SynchronizedLoggedFunction, WhiskProperties}
@@ -705,7 +706,8 @@ class ContainerProxyTests
             collector,
             InvokerInstanceId(0, userMemory = defaultUserMemory),
             poolConfig,
-            pauseGrace = pauseGrace))
+            pauseGrace = pauseGrace)
+          .withDispatcher(CallingThreadDispatcher.Id))
     registerCallback(machine)
     preWarm(machine) //ends in Started state
 
@@ -722,12 +724,14 @@ class ContainerProxyTests
 
     //complete the first run
     runPromises(0).success(runInterval, ActivationResponse.success())
-    expectWarmed(invocationNamespace.name, concurrentAction) //when first completes (count is 0 since stashed not counted)
-    expectMsg(Transition(machine, Running, Ready)) //wait for first to complete to skip the delay step that can only reliably be tested in single threaded
-    expectMsg(Transition(machine, Ready, Running)) //when second starts (after delay...)
+
+    //room for 1 more, so expect NeedWork msg
+    expectWarmed(invocationNamespace.name, concurrentAction) //when first completes
 
     //complete the second run
     runPromises(1).success(runInterval, ActivationResponse.success())
+
+    //room for 1 more, so expect NeedWork msg
     expectWarmed(invocationNamespace.name, concurrentAction) //when second completes
 
     //go back to ready after first and second runs are complete
@@ -740,23 +744,28 @@ class ContainerProxyTests
 
     //third message will go from Ready -> Running -> Ready (after fourth run)
     expectMsg(Transition(machine, Ready, Running))
+    //expect no NeedWork since there are still running and queued messages
+    expectNoMessage(500.milliseconds)
 
     //complete the third run (do not request new work yet)
     runPromises(2).success(runInterval, ActivationResponse.success())
+    //expect no NeedWork since there are still queued messages
+    expectNoMessage(500.milliseconds)
 
     //complete the fourth run -> dequeue the fifth run (do not request new work yet)
     runPromises(3).success(runInterval, ActivationResponse.success())
 
     //complete the fifth run (request new work, 1 active remain)
     runPromises(4).success(runInterval, ActivationResponse.success())
+
+    //request new work since buffer is now empty AND activationCount < concurrent max
     expectWarmed(invocationNamespace.name, concurrentAction) //when fifth completes
 
     //complete the sixth run (request new work 0 active remain)
     runPromises(5).success(runInterval, ActivationResponse.success())
 
-    expectWarmed(invocationNamespace.name, concurrentAction) //when sixth completes
-
     // back to ready
+    expectWarmed(invocationNamespace.name, concurrentAction) //when sixth completes
     expectMsg(Transition(machine, Running, Ready))
 
     //timeout + pause after getting back to Ready
@@ -1416,10 +1425,36 @@ class ContainerProxyTests
     override def initialize(initializer: JsObject, timeout: FiniteDuration, concurrent: Int)(
       implicit transid: TransactionId): Future[Interval] = {
       initializeCount += 1
-      initializer shouldBe action.containerInitializer {
+
+      val envField = "env"
+
+      (initializer.fields - envField) shouldBe (action.containerInitializer {
         activationArguments.fields.filter(k => filterEnvVar(k._1))
-      }
+      }.fields - envField)
       timeout shouldBe action.limits.timeout.duration
+
+      val initializeEnv = initializer.fields(envField).asJsObject
+
+      initializeEnv.fields("__OW_NAMESPACE") shouldBe invocationNamespace.name.toJson
+      initializeEnv.fields("__OW_ACTION_NAME") shouldBe message.action.qualifiedNameWithLeadingSlash.toJson
+      initializeEnv.fields("__OW_ACTION_VERSION") shouldBe message.action.version.toJson
+      initializeEnv.fields("__OW_ACTIVATION_ID") shouldBe message.activationId.toJson
+      initializeEnv.fields("__OW_TRANSACTION_ID") shouldBe transid.id.toJson
+
+      val convertedAuthKey = message.user.authkey.toEnvironment.fields.map(f => ("__OW_" + f._1.toUpperCase(), f._2))
+      val authEnvironment = initializeEnv.fields.filterKeys(convertedAuthKey.contains)
+      if (apiKeyMustBePresent) {
+        convertedAuthKey shouldBe authEnvironment
+      } else {
+        authEnvironment shouldBe empty
+      }
+
+      val deadline = Instant.ofEpochMilli(initializeEnv.fields("__OW_DEADLINE").convertTo[String].toLong)
+      val maxDeadline = Instant.now.plusMillis(timeout.toMillis)
+
+      // The deadline should be in the future but must be smaller than or equal
+      // a freshly computed deadline, as they get computed slightly after each other
+      deadline should (be <= maxDeadline and be >= Instant.now)
 
       initPromise.map(_.future).getOrElse(Future.successful(initInterval))
     }
@@ -1432,6 +1467,7 @@ class ContainerProxyTests
       val runCount = atomicRunCount.incrementAndGet()
       environment.fields("namespace") shouldBe invocationNamespace.name.toJson
       environment.fields("action_name") shouldBe message.action.qualifiedNameWithLeadingSlash.toJson
+      environment.fields("action_version") shouldBe message.action.version.toJson
       environment.fields("activation_id") shouldBe message.activationId.toJson
       environment.fields("transaction_id") shouldBe transid.id.toJson
       val authEnvironment = environment.fields.filterKeys(message.user.authkey.toEnvironment.fields.contains)

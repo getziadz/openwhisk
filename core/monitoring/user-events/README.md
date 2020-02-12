@@ -36,6 +36,15 @@ This service connects to `events` topic and publishes the events to various serv
 The service needs the following env variables to be set
 
 - `KAFKA_HOSTS` - For local env it can be set to `172.17.0.1:9093`. When using [OpenWhisk Devtools][2] based setup use `kafka`
+- Namespaces can be removed from reports by listing them inside the `reference.conf` using the `whisk.user-events.ignored-namespaces` configuration.
+e.g:
+```
+whisk {
+  user-events {
+    ignored-namespaces = ["canary","testing"]
+  }
+}
+```
 
 Integrations
 ------------
@@ -49,7 +58,7 @@ http://localhost:3000/d/Oew1lvymk/openwhisk-action-performance-metrics
 
 The latest version of the dashboard can be found in the "compose/dashboard/openwhisk_events.json"
 
-[1]: https://github.com/apache/incubator-openwhisk/blob/master/docs/metrics.md#user-specific-metrics
-[2]: https://github.com/apache/incubator-openwhisk-devtools/tree/master/docker-compose
+[1]: https://github.com/apache/openwhisk/blob/master/docs/metrics.md#user-specific-metrics
+[2]: https://github.com/apache/openwhisk-devtools/tree/master/docker-compose
 [3]: https://hub.docker.com/r/prom/prometheus/
 [4]: https://hub.docker.com/r/grafana/grafana/
